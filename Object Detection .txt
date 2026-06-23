@@ -1,0 +1,176 @@
+# Instalimi i dependencave
+!pip install ultralytics flask requests pillow matplotlib firebase-admin
+
+import os
+import time
+import requests
+from ultralytics import YOLO
+from google.colab import drive
+from PIL import Image
+import matplotlib.pyplot as plt
+from flask import Flask, jsonify, request
+import logging
+from threading import Thread
+import firebase_admin
+from firebase_admin import credentials, db
+from google.colab import files
+
+# 🔹 Konfigurim i logging për të ndjekur aktivitetet
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 🔹 Lidh Google Drive për fotot nga laptopi
+drive.mount('/content/drive', force_remount=True)
+
+# -------- Parametrat --------
+FOLDER_PATH = '/content/drive/MyDrive/ESP32-CAM'  # Dosja ku laptopi ruan fotot
+MODEL_PATH = '/content/drive/MyDrive/YOLO_Models/best.pt'  # Modeli YOLO
+CHECK_INTERVAL = 1  # Kontrollo çdo 1 sekondë për foto të reja
+CONFIDENCE_THRESHOLD = 0.1  # Prag besueshmërie
+FIREBASE_DB_URL = "https://smart-fridge-24931-default-rtdb.europe-west1.firebasedatabase.app/"
+PENDING_PATH = '/SmartFridge/PendingDetection'  # Rruga në Firebase
+DETECTION_DELAY = 5  # Prit 5 sekonda para se të përpunosh foton pas detektimit
+
+# -------- Ngarko kredencialet e Firebase --------
+print("Upload service account key.json nga Firebase Console:")
+uploaded = files.upload()
+key_file = list(uploaded.keys())[0]
+cred = credentials.Certificate(key_file)
+
+# Kontrollo nëse app ekziston dhe fshije nëse po, për të lejuar ri-inicializim (për Colab sessions)
+default_app_name = firebase_admin._DEFAULT_APP_NAME
+if default_app_name in firebase_admin._apps:
+    firebase_admin.delete_app(firebase_admin.get_app(default_app_name))
+    logging.info("🗑️ Default Firebase app u fshi për të lejuar ri-inicializim.")
+
+firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
+logging.info("✅ Firebase u inicializua me sukses.")
+
+# -------- Ngarko modelin YOLO --------
+try:
+    model = YOLO(MODEL_PATH)
+    logging.info("✅ Modeli YOLO u ngarkua me sukses.")
+except Exception as e:
+    logging.error(f"❌ Gabim gjatë ngarkimit të modelit YOLO: {e}")
+    raise
+
+# -------- Set për të ruajtur fotot e përpunuara --------
+processed_images = set()
+
+# -------- Funksion për të marrë foton më të re që nuk është përpunuar --------
+def get_latest_image(folder_path, processed_images):
+    try:
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+        files = sorted(files, key=lambda x: os.path.getmtime(os.path.join(folder_path, x)), reverse=True)
+        for f in files:
+            path = os.path.join(folder_path, f)
+            if path not in processed_images:
+                return path
+        return None
+    except Exception as e:
+        logging.error(f"❌ Gabim gjatë skanimit të dosjes: {e}")
+        return None
+
+# -------- Funksion për të dërguar produktin në Firebase --------
+def send_to_firebase(product_name):
+    try:
+        ref = db.reference(PENDING_PATH)
+        ref.child('product').set(product_name)
+        logging.info(f"✅ Produkt u dërgua në Firebase: {product_name}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Gabim gjatë dërgimit në Firebase: {e}")
+        return False
+
+# -------- Funksion për të përpunuar foton --------
+def process_image(image_path):
+    try:
+        # Përpuno imazhin me YOLO
+        results = model(image_path)
+
+        detections = []
+        for result in results:
+            names = result.names
+            for box in result.boxes:
+                cls = int(box.cls.item())
+                conf = float(box.conf.item())
+                if conf > CONFIDENCE_THRESHOLD:
+                    detections.append(names[cls])
+
+        if detections:
+            product_list = ", ".join(set(detections))
+            logging.info(f"✅ Detektuar: {product_list}")
+            send_to_firebase(product_list)
+            return product_list
+        else:
+            logging.warning("⚠ Asnjë detektim mbi pragun e besueshmërisë.")
+            send_to_firebase("No product detected")
+            return "No product detected"
+    except Exception as e:
+        logging.error(f"❌ Gabim gjatë përpunimit të fotos {image_path}: {e}")
+        send_to_firebase("Error processing image")
+        return "Error processing image"
+
+# -------- Funksion për të monitoruar Firebase për pending detections --------
+def monitor_firebase():
+    logging.info("🔄 Filloi monitorimi i Firebase për pending detections...")
+    last_timestamp = 0
+    while True:
+        try:
+            ref = db.reference(PENDING_PATH)
+            data = ref.get()
+            if data and 'timestamp' in data and data['timestamp'] > last_timestamp:
+                last_timestamp = data['timestamp']
+                logging.info(f"🔔 Pending detection e re në Firebase (timestamp: {last_timestamp})")
+
+                # Prit 5 sekonda për të siguruar që fotoja është ruajtur
+                logging.info(f"⏳ Po pres {DETECTION_DELAY} sekonda para se të përpunoj foton...")
+                time.sleep(DETECTION_DELAY)
+
+                # Merr foton më të re
+                latest_image = get_latest_image(FOLDER_PATH, processed_images)
+                if latest_image:
+                    mtime = os.path.getmtime(latest_image)
+                    # Kontrollo nëse mtime është afër timestamp (brenda 60 sekondave)
+                    if abs(mtime - last_timestamp) < 60:
+                        process_image(latest_image)
+                        processed_images.add(latest_image)
+                    else:
+                        logging.warning(f"⚠ Fotoja më e re nuk përputhet me timestamp (mtime: {mtime})")
+                else:
+                    logging.warning("⚠ Asnjë foto e re nuk u gjet në dosje.")
+            time.sleep(CHECK_INTERVAL)
+        except Exception as e:
+            logging.error(f"❌ Gabim në monitorimin e Firebase: {e}")
+            time.sleep(CHECK_INTERVAL)
+
+# -------- Konfigurim i Flask --------
+app = Flask(__name__)
+
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    try:
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
+        file = request.files['image']
+        image_path = os.path.join(FOLDER_PATH, f"esp32_{int(time.time())}.jpg")
+        file.save(image_path)
+        logging.info(f"📸 Foto e re u ruajt: {image_path}")
+
+        # Përpuno foton dhe dërgo në Firebase
+        product = process_image(image_path)
+        processed_images.add(image_path)
+        return jsonify({'status': 'Image processed', 'product': product}), 200
+    except Exception as e:
+        logging.error(f"❌ Gabim gjatë përpunimit të upload-it: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# -------- Nis Flask dhe monitorimin në sfond --------
+if __name__ == '__main__':
+    # Nis monitorimin e Firebase në një thread të veçantë
+    firebase_thread = Thread(target=monitor_firebase)
+    firebase_thread.daemon = True
+    firebase_thread.start()
+
+    # Nis serverin Flask
+    logging.info("🌐 Flask serveri po niset në http://0.0.0.0:5000 (përdor ngrok për ekspozim extern nëse nevojitet)")
+    app.run(host='0.0.0.0', port=5000)

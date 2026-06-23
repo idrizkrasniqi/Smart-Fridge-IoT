@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="sq">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Smart Fridge — Web UI (Firebase + WebRTC)</title>
+<style>
+:root{--bg1:#071023;--bg2:#0b1020;--accent:#8b5cf6;--card:rgba(255,255,255,0.03);--muted:rgba(255,255,255,0.7)}
+*{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+body{margin:0;background:linear-gradient(180deg,var(--bg1),var(--bg2));color:#e6eef8;min-height:100vh}
+.container{max-width:1100px;margin:14px auto;padding:12px;display:grid;grid-template-columns:1fr 360px;gap:14px}
+.card{background:var(--card);padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,0.03)}
+.header{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.stream img, .stream video{width:100%;height:auto;border-radius:8px;background:#000}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn{background:linear-gradient(90deg,var(--accent),#5b21b6);border:none;color:white;padding:8px 12px;border-radius:10px;font-weight:700;cursor:pointer}
+.muted{color:var(--muted);font-size:13px}
+.small{font-size:13px}
+.sensor-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.sensor{background:rgba(255,255,255,0.02);padding:8px;border-radius:8px}
+.sensor .val{font-weight:800;font-size:18px}
+#logList{max-height:260px;overflow:auto;margin-top:8px}
+.settings{display:flex;flex-direction:column;gap:8px}
+.range-row{display:flex;gap:8px;align-items:center}
+.range-row input[type=number]{flex:1}
+.footer{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+.config-box{background:rgba(0,0,0,0.4);padding:10px;border-radius:8px;margin-bottom:8px}
+label{font-size:12px;color:var(--muted);}
+input.config{width:100%;padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+@media (max-width:980px){.container{grid-template-columns:1fr;padding:8px}.header{flex-direction:column;align-items:flex-start}.controls{width:100%}.sensor-grid{grid-template-columns:1fr}}
+#stockList .sensor {
+background: rgba(0, 255, 0, 0.05);
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <div class="header">
+      <div>
+        <h2 style="margin:0">Smart Fridge — Live (Firebase + WebRTC)</h2>
+        <div class="muted small">Kjo faqe lidhet direkt me Firebase dhe mundëson livestream përmes ngrok / WebRTC.</div>
+      </div>
+      <div class="controls">
+        <button class="btn" id="refreshBtn">Refresh</button>
+        <button class="btn" id="startStream">Start Live</button>
+        <button class="btn" id="stopStream">Stop Live</button>
+        <div class="muted" id="conn">Connecting...</div>
+      </div>
+    </div>
+
+    <div style="height:10px"></div>
+
+    <div class="stream">
+      <!-- video për WebRTC livestream -->
+      <video id="remoteVideo" autoplay playsinline controls></video>
+    </div>
+
+    <div style="height:10px"></div>
+
+    <div class="sensor-grid">
+      <div class="sensor"><div class="muted">Top detection</div><div id="topLabel" class="val">—</div></div>
+      <div class="sensor"><div class="muted">Project / DB</div><div id="projLabel" class="val">—</div></div>
+      <div class="sensor"><div class="muted">Raw state</div><pre id="rawResp" style="white-space:pre-wrap;max-height:120px;overflow:auto;background:rgba(0,0,0,0.06);padding:6px;border-radius:6px"></pre></div>
+      <div class="sensor"><div class="muted">Last detection</div><div id="lastDetect" class="val">—</div></div>
+    </div>
+
+    <div class="footer">Ndrysho vlerat e <code>firebaseConfig</code> dhe <code>NGROK_HOST</code> sipas projektit tënd.</div>
+
+    <!-- Shtuar: Config box për të vendosur NGROK_HOST dinamikisht (ruhet në localStorage) -->
+    <div class="config-box">
+      <label for="ngrokInput">Ngrok Host për WebRTC (i fikse nga konfigurimi)</label>
+      <input id="ngrokInput" class="config" placeholder="Vendos host-in këtu">
+      <div style="height:6px"></div>
+      <button class="btn" id="saveNgrok">Save & Reload</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 8px 0">Sensors & Settings (nga Firebase)</h3>
+    <div class="sensor-grid">
+      <div class="sensor"><div class="muted">Temperature</div><div id="temp" class="val">-- °C</div></div>
+      <div class="sensor"><div class="muted">Humidity</div><div id="hum" class="val">-- %</div></div>
+      <div class="sensor"><div class="muted">Weight</div><div id="weight" class="val">--</div></div>
+      <div class="sensor"><div class="muted">Δ (delta)</div><div id="delta" class="val">--</div></div>
+      <div class="sensor"><div class="muted">Door</div><div id="door" class="val">--</div></div>
+      <div class="sensor"><div class="muted">Pending</div><div id="pending" class="val">--</div></div>
+      <div class="sensor"><div class="muted">LED</div><div id="led" class="val">--</div></div>
+      <div class="sensor"><div class="muted">Fan Speed</div><div id="fanSpeed" class="val">--</div></div>
+    </div>
+
+    <div style="height:8px"></div>
+
+    <div class="settings">
+      <div class="muted">Fan temperature threshold (°C)</div>
+      <div class="range-row"><input id="fanInput" type="number" min="15" max="40" step="0.1"><div style="width:64px;text-align:right" id="fanVal">—</div></div>
+      <div class="muted">Weight tolerance (units of scale)</div>
+      <div class="range-row"><input id="tolInput" type="number" min="0" max="100" step="0.5"><div style="width:64px;text-align:right" id="tolVal">—</div></div>
+      <div style="display:flex;gap:8px"><button class="btn" id="saveSettings">Save settings</button><button class="btn" id="resetSettings">Reset Defaults</button></div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div style="height:12px"></div>
+    <h3 style="margin:0 0 8px 0">Stock (Realtime)</h3>
+    <div id="stockList" class="sensor-grid"></div>
+
+    <div class="muted">Logs (realtime from Firebase)</div>
+    <div id="logList"></div>
+
+    <div style="height:8px"></div>
+    <div style="display:flex;gap:8px"><button class="btn" id="clearLogs">Clear Logs in DB</button></div>
+  </div>
+</div>
+
+<!-- Firebase modular SDK (v9+/v12) -->
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js';
+  import {
+    getDatabase,
+    ref,
+    onValue,
+    set,
+    get,
+    child,
+    remove
+  } from 'https://www.gstatic.com/firebasejs/12.2.1/firebase-database.js';
+
+  // --- Firebase config (ndrysho nëse duhet) ---
+  const firebaseConfig = {
+    apiKey: "AIzaSyAA9mExgniNEuR2QRiYnv-IjjnUVJOzqlM",
+    authDomain: "smart-fridge-24931.firebaseapp.com",
+    databaseURL: "https://smart-fridge-24931-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "smart-fridge-24931",
+    storageBucket: "smart-fridge-24931.firebasestorage.app",
+    messagingSenderId: "989576212624",
+    appId: "1:989576212624:web:643fa93e6b597419b5e815",
+    measurementId: "G-MPZ4Y4LPR9"
+  };
+
+  let app = null;
+  let db = null;
+  let rootRef = null;
+
+  // UI refs (global DOM)
+  const connEl = document.getElementById('conn');
+  const topLabel = document.getElementById('topLabel');
+  const rawResp = document.getElementById('rawResp');
+  const tempEl = document.getElementById('temp');
+  const humEl = document.getElementById('hum');
+  const weightEl = document.getElementById('weight');
+  const deltaEl = document.getElementById('delta');
+  const doorEl = document.getElementById('door');
+  const pendingEl = document.getElementById('pending');
+  const lastDetectEl = document.getElementById('lastDetect');
+  const logList = document.getElementById('logList');
+  const fanInput = document.getElementById('fanInput');
+  const fanVal = document.getElementById('fanVal');
+  const tolInput = document.getElementById('tolInput');
+  const tolVal = document.getElementById('tolVal');
+  const saveSettings = document.getElementById('saveSettings');
+  const resetSettings = document.getElementById('resetSettings');
+  const refreshBtn = document.getElementById('refreshBtn');
+  const clearLogsBtn = document.getElementById('clearLogs');
+  const fanSpeedEl = document.getElementById('fanSpeed');
+  const projLabel = document.getElementById('projLabel');
+
+  // Initialize firebase and realtime listeners
+  function initFirebase() {
+    try {
+      app = initializeApp(firebaseConfig);
+      db = getDatabase(app);
+      rootRef = ref(db, 'SmartFridge');
+      connEl.innerText = 'Connected (using Firebase)';
+      projLabel.innerText = firebaseConfig.projectId || '--';
+
+      onValue(rootRef, (snapshot) => {
+        const data = snapshot.val() || {};
+        rawResp.innerText = JSON.stringify(data, null, 2);
+
+        if (data.Environment) {
+          tempEl.innerText = (data.Environment.temperature !== undefined ? data.Environment.temperature : '--') + ' °C';
+          humEl.innerText = (data.Environment.humidity !== undefined ? data.Environment.humidity : '--') + ' %';
+        }
+
+        if (data.States) {
+          doorEl.innerText = data.States.Door || '--';
+          fanSpeedEl.innerText = (data.States.Fan && data.States.Fan.speed !== undefined) ? data.States.Fan.speed : '--';
+        }
+
+        if (data.lastDetection) lastDetectEl.innerText = data.lastDetection;
+        if (data.weight_total !== undefined) weightEl.innerText = data.weight_total + ' g';
+        if (data.Settings) {
+          if (data.Settings.fanThreshold !== undefined) { fanInput.value = data.Settings.fanThreshold; fanVal.innerText = data.Settings.fanThreshold + '°C'; }
+          if (data.Settings.tolerance !== undefined) { tolInput.value = data.Settings.tolerance; tolVal.innerText = data.Settings.tolerance; }
+        }
+
+        if (data.Logs) {
+          const arr = Object.keys(data.Logs).map(k => data.Logs[k]);
+          arr.sort((a,b)=> (a.ts||0) - (b.ts||0));
+          renderLogs(arr);
+          if (arr.length>0 && arr[arr.length-1].product) topLabel.innerText = arr[arr.length-1].product;
+        }
+        if (data.Stock && typeof data.Stock === 'object') {
+          renderStock(data.Stock);
+        }else {
+          // Opsionale: Shfaq mesazh nëse nuk ka stok
+          document.getElementById('stockList').innerHTML = '<div class="muted">Nuk ka produkte në stok.</div>';
+        }
+      }, (err) => { connEl.innerText = 'Error listening: ' + (err && err.code ? err.code : err); rawResp.innerText = ''; });
+
+    } catch(e) {
+      console.error(e);
+      connEl.innerText = 'Init error: ' + e.message;
+    }
+  } 
+  function renderLogs(arr) {
+    logList.innerHTML = '';
+    const last = arr.slice(-20);
+    for (let i = last.length-1; i>=0; i--) {
+      const it = last[i];
+      const div = document.createElement('div');
+      div.style.padding = '8px';
+      div.style.borderBottom = '1px solid rgba(255,255,255,0.04)';
+      const ts = it.ts ? new Date(it.ts).toLocaleString() : '-';
+      div.innerHTML = `<div style='font-weight:700'>${it.product||'-'}</div><div class='muted' style='font-size:12px'>${ts} Δ=${it.delta||0} act=${it.action||''}</div>`;
+      logList.appendChild(div);
+    }
+  }
+
+  async function saveSettingsToDB() {
+    if (!db) return alert('Firebase nuk eshte inicializuar');
+    const ft = parseFloat(fanInput.value);
+    const tol = parseFloat(tolInput.value);
+    const write = {};
+    if (!isNaN(ft)) write.fanThreshold = ft;
+    if (!isNaN(tol)) write.tolerance = tol;
+    try {
+      await set(ref(db, 'SmartFridge/Settings'), write);
+      alert('Settings saved to Firebase');
+    } catch(e) { alert('Save failed: ' + e.message); }
+  }
+
+  async function resetSettingsInDB() {
+    if (!db) return alert('Firebase nuk eshte inicializuar');
+    try {
+      await set(ref(db, 'SmartFridge/Settings'), { fanThreshold: 26.5, tolerance: 5.0 });
+      alert('Reset to defaults (26.5°C, 5)');
+    } catch(e) { alert('Reset failed: ' + e.message); }
+  }
+
+  async function clearLogsInDB() {
+    if (!db) return alert('Firebase nuk eshte inicializuar');
+    if (!confirm('Pastroni të gjitha logs në Firebase? Kjo veprim fshin të gjitha hyrjet nën /SmartFridge/Logs.')) return;
+    try {
+      await remove(ref(db, 'SmartFridge/Logs'));
+      alert('Logs cleared');
+    } catch(e) { alert('Clear failed: ' + e.message); }
+  }
+
+  // DOM events for settings / actions
+  saveSettings.addEventListener('click', saveSettingsToDB);
+  resetSettings.addEventListener('click', resetSettingsInDB);
+  refreshBtn.addEventListener('click', () => { connEl.innerText = 'Refreshing...'; setTimeout(()=> connEl.innerText = 'Connected (using Firebase)', 800); });
+  clearLogsBtn.addEventListener('click', clearLogsInDB);
+
+  // Init on load
+  window.addEventListener('load', () => {
+    initFirebase();
+  });
+  function renderStock(stockData) {
+  const stockList = document.getElementById('stockList');
+  stockList.innerHTML = ''; // Pastron listën para rifreskimit
+
+  const products = Object.keys(stockData);
+  if (products.length === 0) {
+    stockList.innerHTML = '<div class="muted">Nuk ka produkte në stok.</div>';
+    return;
+  }
+
+  products.forEach(productName => {
+    const product = stockData[productName];
+    const div = document.createElement('div');
+    div.className = 'sensor';
+    div.innerHTML = `
+      <div style="font-weight:700">${productName}</div>
+      <div class="muted" style="font-size:12px">
+        Pesha totale: ${product.weight_total || 0} g <br>
+        Sasia: ${product.quantity || 0}
+      </div>
+    `;
+    stockList.appendChild(div);
+  });
+  }
+</script>
+
+<!-- WebRTC livestream script (non-module) -->
+<script>
+  // --- WebRTC / signaling config ---
+  // NGROK_HOST set to fixed domain so user nuk mund ta ndryshoje.
+  const NGROK_HOST = 'settling-lobster-distinctly.ngrok-free.app'; // <-- FIXED (user cannot change)
+  const signalingPath = ""; // shto rrugën nëse serveri yt e kërkon, p.sh. "/ws"
+  const makeSignalingUrl = () => `wss://${NGROK_HOST}${signalingPath}`;
+
+  const videoEl = document.getElementById('remoteVideo');
+  const statusEl = document.getElementById('conn');
+  const startBtn = document.getElementById('startStream');
+  const stopBtn = document.getElementById('stopStream');
+
+  // Shtuar: UI për të vendosur NGROK_HOST
+  const ngrokInput = document.getElementById('ngrokInput');
+  const saveNgrok = document.getElementById('saveNgrok');
+  if (ngrokInput) {
+    ngrokInput.value = NGROK_HOST;  // Shfaq vlerën aktuale (e fikse)
+    ngrokInput.disabled = true;     // Përdoruesi nuk mund ta ndryshojë
+  }
+  if (saveNgrok) {
+    // Fshi butonin Save që të mos lejojë ndryshim nga përdoruesi
+    saveNgrok.style.display = 'none';
+  }
+
+  let signaling = null;
+  let pc = null;
+  let localIceQueue = [];
+
+  function createPeerConnection() {
+    pc = new RTCPeerConnection();
+
+    // We only want to receive video from the remote (ESP/laptop)
+    pc.addTransceiver("video", { direction: "recvonly" });
+
+    pc.ontrack = (e) => {
+      // attach remote stream to video element
+      try {
+        videoEl.srcObject = e.streams[0];
+      } catch (err) {
+        console.warn('Could not set video srcObject:', err);
+        // fallback: create blob URL (rarely needed)
+        // videoEl.src = URL.createObjectURL(e.streams[0]);
+      }
+    };
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && signaling && signaling.readyState === WebSocket.OPEN) {
+        signaling.send(JSON.stringify({ type: "candidate", candidate: {
+          candidate: ev.candidate.candidate,
+          sdpMid: ev.candidate.sdpMid,
+          sdpMLineIndex: ev.candidate.sdpMLineIndex
+        }}));
+      } else if (ev.candidate) {
+        // store until signaling opens
+        localIceQueue.push(ev.candidate);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log('PC state:', pc.connectionState);
+      if (pc.connectionState === 'connected') statusEl.innerText = 'Stream active';
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') statusEl.innerText = 'Stream disconnected';
+    };
+  }
+
+  async function startStreamRTC() {
+    if (!NGROK_HOST) return alert("NGROK_HOST nuk është konfiguruar");
+    statusEl.innerText = "Connecting WebRTC (signaling)...";
+
+    try {
+      signaling = new WebSocket(makeSignalingUrl());
+
+      signaling.onopen = async () => {
+        console.log('Signaling open');
+        statusEl.innerText = "Signaling connected — creating offer...";
+        createPeerConnection();
+
+        // flush queued ICEs when ready
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate && signaling.readyState === WebSocket.OPEN) {
+            signaling.send(JSON.stringify({ type:"candidate", candidate:{
+              candidate: ev.candidate.candidate, sdpMid: ev.candidate.sdpMid, sdpMLineIndex: ev.candidate.sdpMLineIndex
+            }}));
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // Send offer to signaling server (sdp only)
+        signaling.send(JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }));
+        statusEl.innerText = "Offer sent, waiting for answer...";
+      };
+
+      signaling.onmessage = async (evt) => {
+        try {
+          const d = JSON.parse(evt.data);
+          if (d.type === "answer" && d.sdp) {
+            await pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
+            statusEl.innerText = "Stream active";
+          } else if (d.type === "candidate" && d.candidate) {
+            // remote ICE candidate from server
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(d.candidate));
+            } catch (err) {
+              console.warn('addIceCandidate failed:', err);
+            }
+          } else if (d.type === "error") {
+            console.error('Signaling error message:', d);
+            statusEl.innerText = "Signaling error: " + (d.msg || 'unknown');
+          } else {
+            console.log('Signaling message:', d);
+          }
+        } catch (err) {
+          console.error('Invalid signaling message', err, evt.data);
+        }
+      };
+
+      signaling.onerror = (ev) => {
+        console.error('Signaling websocket error', ev);
+        statusEl.innerText = "Signaling error";
+      };
+
+      signaling.onclose = () => {
+        console.log('Signaling closed');
+        statusEl.innerText = "Signaling closed";
+      };
+
+    } catch (e) {
+      console.error('Start stream failed', e);
+      statusEl.innerText = "Start failed: " + e.message;
+      stopStreamRTC();
+    }
+  }
+
+  function stopStreamRTC() {
+    try {
+      if (pc) { pc.close(); pc = null; }
+      if (signaling) { signaling.close(); signaling = null; }
+      if (videoEl) { try { videoEl.srcObject = null; videoEl.pause(); } catch(e){} }
+      statusEl.innerText = "Stream stopped";
+    } catch(e) {
+      console.warn('Stop error', e);
+    }
+  }
+
+  // Bind UI buttons
+  startBtn.addEventListener('click', startStreamRTC);
+  stopBtn.addEventListener('click', stopStreamRTC);
+
+  // Optional: stop stream when user navigates away
+  window.addEventListener('beforeunload', stopStreamRTC);
+</script>
+</body>
+</html>
